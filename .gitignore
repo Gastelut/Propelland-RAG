@@ -1,0 +1,10 @@
+@
+.env
+*.sqlite
+*.sqlite*
+__pycache__/
+*.log
+propelland-rag-data/
+rag_db/
+qdrant_data/
+
