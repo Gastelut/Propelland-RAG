@@ -1,7 +1,7 @@
 import os
 import sqlite3, sys
 
-db = r"C:\Users\Bastian\rag_db\rag_state.sqlite"
+db = r"C:\Users\Bastian\propelland-rag-data\db\rag_state.sqlite"
 query = " ".join(sys.argv[1:]).strip()
 if not query:
     raise SystemExit('Usage: py find_files.py "cimd proposal"')
@@ -12,7 +12,7 @@ con = sqlite3.connect(db)
 cur = con.cursor()
 
 rows = cur.execute(
-    "SELECT f.path, f.ext, f.status, p.name, p.company, p.industry, p.services "
+    "SELECT f.path, f.ext, f.status, p.project_name, p.company, p.industry, p.services "
     "FROM files f LEFT JOIN projects p ON f.project_id = p.project_id"
 ).fetchall()
 

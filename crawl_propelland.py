@@ -1,10 +1,14 @@
 import os, sys, re, sqlite3, hashlib, datetime, logging
+import warnings
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct
+
+# Suppress msvcrt import warning from portalocker (Windows specific)
+warnings.filterwarnings("ignore", category=ImportWarning)
 
 # Silence pypdf spam
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -16,7 +20,8 @@ ROOTS = [
 ]
 
 DB_PATH = r"C:\Users\Bastian\propelland-rag-data\db\rag_state.sqlite"
-QDRANT_URL = "http://localhost:6333"
+QDRANT_URL = None  # Use local storage instead of Docker
+QDRANT_PATH = r"C:\Users\Bastian\propelland-rag-data\qdrant"
 PROJECT_COLLECTION = "project_cards"
 
 CONTENT_EXTS = {".pdf"}
@@ -123,10 +128,65 @@ def main():
         raise SystemExit("OPENAI_API_KEY missing in .env")
 
     client = OpenAI(api_key=api_key)
-    qdrant = QdrantClient(url=QDRANT_URL)
+    # Use local Qdrant storage instead of Docker
+    qdrant = QdrantClient(path=QDRANT_PATH)
+    
+    # Create Qdrant collection if it doesn't exist
+    from qdrant_client.http.models import VectorParams
+    try:
+        # Check if collection exists
+        qdrant.get_collection(PROJECT_COLLECTION)
+        print(f"Qdrant collection '{PROJECT_COLLECTION}' already exists")
+    except Exception:
+        # Create collection
+        qdrant.create_collection(
+            collection_name=PROJECT_COLLECTION,
+            vectors_config=VectorParams(size=1536, distance="Cosine")
+        )
+        print(f"Created Qdrant collection '{PROJECT_COLLECTION}'")
 
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    
+    # Create tables if they don't exist
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            file_id TEXT PRIMARY KEY,
+            path TEXT,
+            ext TEXT,
+            size INTEGER,
+            modified TEXT,
+            rev TEXT,
+            project_id TEXT,
+            status TEXT,
+            last_indexed TEXT,
+            content_sig TEXT,
+            text_sig TEXT
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS projects (
+            project_id TEXT PRIMARY KEY,
+            project_name TEXT,
+            company TEXT,
+            industry TEXT,
+            services TEXT,
+            summary TEXT,
+            last_indexed TEXT
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS project_sources (
+            project_id TEXT,
+            file_id TEXT,
+            path TEXT,
+            PRIMARY KEY (project_id, file_id)
+        )
+    ''')
+    
+    con.commit()
 
     scanned = 0
     meta_only = 0
@@ -257,6 +317,7 @@ def main():
                             (project_id, fid, local_path)
                         )
 
+                        print(f"Creating project card for {project_name} ({company})")
                         # Vector
                         embed_input = f"{project_name} | {company} | {industry} | {', '.join(services)} | {summary}"
                         emb = client.embeddings.create(model="text-embedding-3-small", input=embed_input).data[0].embedding
@@ -274,6 +335,7 @@ def main():
                             }
                         )
                         qdrant.upsert(collection_name=PROJECT_COLLECTION, points=[point])
+                        print(f"Upserted to Qdrant collection '{PROJECT_COLLECTION}'")
 
                         upsert_file(cur, fid, local_path, ext, size, modified, project_id, "project_card_created", content_sig=new_sig)
                         project_cards += 1
@@ -288,6 +350,7 @@ def main():
 
     con.commit()
     con.close()
+    qdrant.close()
 
     print("DONE")
     print("scanned:", scanned)
