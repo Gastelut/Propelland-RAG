@@ -1,4 +1,4 @@
-import os, sys, re, sqlite3, hashlib, datetime, logging
+import os, sys, re, sqlite3, hashlib, datetime, logging, tempfile
 import warnings
 from pathlib import Path
 from dotenv import load_dotenv
@@ -6,6 +6,7 @@ from openai import OpenAI
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct
+import dropbox
 
 # Suppress msvcrt import warning from portalocker (Windows specific)
 warnings.filterwarnings("ignore", category=ImportWarning)
@@ -14,7 +15,18 @@ warnings.filterwarnings("ignore", category=ImportWarning)
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 # ----- CONFIG -----
-ROOTS = [
+# Use Dropbox API or local file system
+USE_DROPBOX = True  # Set to False to use local file system
+
+# Dropbox configuration (required if USE_DROPBOX=True)
+DROPBOX_ACCESS_TOKEN = None  # Will be initialized in main() after load_dotenv()
+DROPBOX_ROOTS = [
+    "/01 Client Projects/Converse",
+    "/02 Business Development/02 Case Studies/Converse",
+]
+
+# Local file system configuration (required if USE_DROPBOX=False)
+LOCAL_ROOTS = [
     r"C:\Users\Bastian\Propelland Dropbox\01 Client Projects",
     r"C:\Users\Bastian\Propelland Dropbox\02 Business Development",
 ]
@@ -36,6 +48,43 @@ MAX_PDF_BYTES = 50 * 1024 * 1024  # 50MB
 # ----- HELPERS -----
 def now_utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+# ----- DROPBOX HELPERS -----
+def get_dropbox_client() -> dropbox.Dropbox:
+    """Get a Dropbox client instance using the access token from environment"""
+    if not DROPBOX_ACCESS_TOKEN:
+        raise SystemExit("DROPBOX_ACCESS_TOKEN missing in .env")
+    return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+
+def list_dropbox_files(dbx: dropbox.Dropbox, root: str):
+    """List all files in a Dropbox directory recursively"""
+    files = []
+    try:
+        # List root directory
+        result = dbx.files_list_folder(root, recursive=True)
+        
+        while True:
+            for entry in result.entries:
+                if isinstance(entry, dropbox.files.FileMetadata):
+                    files.append(entry)
+            
+            if not result.has_more:
+                break
+                
+            result = dbx.files_list_folder_continue(result.cursor)
+    except Exception as e:
+        print(f"Error listing Dropbox files in {root}: {e}")
+    
+    return files
+
+def download_dropbox_file(dbx: dropbox.Dropbox, dropbox_path: str, local_path: str):
+    """Download a file from Dropbox to local temporary file"""
+    try:
+        dbx.files_download_to_file(local_path, dropbox_path)
+        return True
+    except Exception as e:
+        print(f"Error downloading {dropbox_path}: {e}")
+        return False
 
 def is_online_only(path: str) -> bool:
     import os
@@ -68,6 +117,16 @@ def should_skip_path(p: Path) -> bool:
     # Skip anything inside a Keynote package folder (*.key/...) but allow the .key file itself
     if any(part.lower().endswith(".key") for part in p.parts):
         return p.suffix.lower() != ".key"
+    # Skip specific excluded folders
+    excluded_folders = [
+        # Add folder names or patterns to exclude
+        "Archive",
+        "Old Projects",
+        "Templates",
+    ]
+    for folder in excluded_folders:
+        if folder.lower() in str(p).lower():
+            return True
     return False
 
 def upsert_file(cur, file_id, path, ext, size, modified, project_id, status, rev=None, content_sig=None, text_sig=None):
@@ -126,10 +185,19 @@ def main():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise SystemExit("OPENAI_API_KEY missing in .env")
+    
+    # Initialize Dropbox configuration
+    global DROPBOX_ACCESS_TOKEN
+    DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 
     client = OpenAI(api_key=api_key)
     # Use local Qdrant storage instead of Docker
     qdrant = QdrantClient(path=QDRANT_PATH)
+    
+    # Initialize Dropbox client if using Dropbox
+    dbx = None
+    if USE_DROPBOX:
+        dbx = get_dropbox_client()
     
     # Create Qdrant collection if it doesn't exist
     from qdrant_client.http.models import VectorParams
@@ -195,46 +263,192 @@ def main():
     errors = 0
     skipped_unchanged = 0
 
-    for root in ROOTS:
-        print(f"== Root start: {root} ==")  
+    # Crawl files based on mode
+    if USE_DROPBOX:
+        roots = DROPBOX_ROOTS
+    else:
+        roots = LOCAL_ROOTS
+    
+    for root in roots:
+        print(f"== Root start: {root} ==")
         
-        for p in Path(root).rglob("*"):
-            
-            if not p.is_file():
-                continue
-            if should_skip_path(p):
-                continue
-            
-            scanned += 1
-            if scanned % 500 == 0:
-                print(f"[{root}] scanned={scanned} pdf_indexed={pdf_indexed} meta_only={meta_only} errors={errors}")
-            ext = p.suffix.lower()
-            local_path = str(p)
-
-            try:
-                st = p.stat()
-                size = st.st_size
-                mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
-                modified = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc).isoformat()
-            except Exception:
-                size = None
-                mtime_ns = None
-                modified = None
-
-            fid = file_id_for_path(local_path)
-            new_sig = calc_content_sig(size, mtime_ns)
-            row_sig = cur.execute("SELECT content_sig FROM files WHERE file_id=?", (fid,)).fetchone()
-            old_sig = row_sig[0] if row_sig else None
-            row_exists = cur.execute("SELECT 1 FROM files WHERE file_id=?", (fid,)).fetchone()
-            if row_exists and old_sig and new_sig and old_sig == new_sig:
-                if ext == ".pdf" and is_online_only(local_path):
-                    upsert_file(cur, fid, local_path, ext, size, modified, None, "online_only", content_sig=new_sig)
-                    meta_only += 1
+        if USE_DROPBOX:
+            # Dropbox mode
+            files = list_dropbox_files(dbx, root)
+            for entry in files:
+                scanned += 1
+                if scanned % 500 == 0:
+                    print(f"[{root}] scanned={scanned} pdf_indexed={pdf_indexed} meta_only={meta_only} errors={errors}")
+                
+                ext = os.path.splitext(entry.path_display)[1].lower()
+                dropbox_path = entry.path_display
+                
+                # Skip unwanted files
+                if should_skip_path(Path(entry.name)):
                     continue
+                
+                size = entry.size
+                modified = entry.server_modified.isoformat()
+                mtime_ns = entry.server_modified.timestamp() * 1_000_000_000
+                
+                fid = file_id_for_path(dropbox_path)
+                new_sig = calc_content_sig(size, mtime_ns)
+                row_sig = cur.execute("SELECT content_sig FROM files WHERE file_id=?", (fid,)).fetchone()
+                old_sig = row_sig[0] if row_sig else None
+                row_exists = cur.execute("SELECT 1 FROM files WHERE file_id=?", (fid,)).fetchone()
+                
+                if row_exists and old_sig and new_sig and old_sig == new_sig:
+                    skipped_unchanged += 1
+                    cur.execute("UPDATE files SET last_indexed=? WHERE file_id=?", (now_utc(), fid))
+                    continue
+                
+                try:
+                    # Keynote: metadata-only unless there is a neighboring PDF
+                    if ext == KEYNOTE_EXT:
+                        # Check if there's a neighboring PDF in Dropbox
+                        pdf_path = dropbox_path.replace(KEYNOTE_EXT, ".pdf")
+                        try:
+                            dbx.files_get_metadata(pdf_path)
+                            upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "shadowed_by_pdf", content_sig=new_sig)
+                        except:
+                            upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "metadata_only", content_sig=new_sig)
+                            meta_only += 1
+                        continue
+                    
+                    # Always store metadata
+                    if not row_exists:
+                        upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "seen", content_sig=new_sig)
+                    
+                    # PDF content indexing
+                    if ext in CONTENT_EXTS:
+                        if size and size > MAX_PDF_BYTES:
+                            upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "metadata_only_too_large", content_sig=new_sig)
+                            meta_only += 1
+                            continue
+                        
+                        # Download file to temporary location for processing
+                        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_file:
+                            tmp_path = tmp_file.name
+                        
+                        if download_dropbox_file(dbx, dropbox_path, tmp_path):
+                            text = extract_pdf_text(tmp_path)
+                            os.unlink(tmp_path)  # Clean up temporary file
+                            
+                            if not text.strip():
+                                upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "metadata_only_no_text", content_sig=new_sig)
+                                meta_only += 1
+                                continue
+                            
+                            pdf_indexed += 1
+                            
+                            # Only create project cards in proposal-ish areas
+                            if is_proposal_doc(dropbox_path):
+                                raw_json = make_project_card(client, text)
+                                
+                                import json
+                                try:
+                                    data = json.loads(raw_json)
+                                except Exception:
+                                    errors += 1
+                                    upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "project_parse_invalid_json", content_sig=new_sig)
+                                    continue
+                                
+                                if data.get("not_project") is True:
+                                    upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "indexed_no_project", content_sig=new_sig)
+                                    continue
+                                
+                                project_name = (data.get("project_name") or "").strip()
+                                company = (data.get("company") or "").strip()
+                                industry = (data.get("industry") or "").strip()
+                                services = parse_services(data.get("services"))
+                                summary = (data.get("summary") or "").strip()
+                                
+                                if not project_name or not company or not summary:
+                                    upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "project_parse_missing_fields", content_sig=new_sig)
+                                    continue
+                                
+                                project_id = hashlib.md5((project_name + "|" + company).encode("utf-8")).hexdigest()
+                                
+                                # DB
+                                cur.execute(
+                                    "INSERT OR REPLACE INTO projects VALUES (?,?,?,?,?,?,?)",
+                                    (project_id, project_name, company, industry, ", ".join(services), summary, now_utc())
+                                )
+                                cur.execute(
+                                    "INSERT OR REPLACE INTO project_sources VALUES (?,?,?)",
+                                    (project_id, fid, dropbox_path)
+                                )
+                                
+                                print(f"Creating project card for {project_name} ({company})")
+                                # Vector
+                                embed_input = f"{project_name} | {company} | {industry} | {', '.join(services)} | {summary}"
+                                emb = client.embeddings.create(model="text-embedding-3-small", input=embed_input).data[0].embedding
+                                point = PointStruct(
+                                    id=int(project_id[:8], 16),
+                                    vector=emb,
+                                    payload={
+                                        "project_id": project_id,
+                                        "project_name": project_name,
+                                        "company": company,
+                                        "industry": industry,
+                                        "services": services,
+                                        "summary": summary,
+                                        "path": dropbox_path,
+                                    }
+                                )
+                                qdrant.upsert(collection_name=PROJECT_COLLECTION, points=[point])
+                                print(f"Upserted to Qdrant collection '{PROJECT_COLLECTION}'")
+                                
+                                upsert_file(cur, fid, dropbox_path, ext, size, modified, project_id, "project_card_created", content_sig=new_sig)
+                                project_cards += 1
+                        else:
+                            upsert_file(cur, fid, dropbox_path, ext, size, modified, None, "download_error", content_sig=new_sig)
+                            errors += 1
+                
+                except Exception as e:
+                    errors += 1
+                    upsert_file(cur, fid, dropbox_path, ext, size, modified, None, f"error:{type(e).__name__}")
+                
+                if scanned % 50 == 0:
+                    con.commit()
+        else:
+            # Local file system mode (original behavior)
+            for p in Path(root).rglob("*"):
+                if not p.is_file():
+                    continue
+                if should_skip_path(p):
+                    continue
+                
+                scanned += 1
+                if scanned % 500 == 0:
+                    print(f"[{root}] scanned={scanned} pdf_indexed={pdf_indexed} meta_only={meta_only} errors={errors}")
+                ext = p.suffix.lower()
+                local_path = str(p)
 
-                skipped_unchanged += 1
-                cur.execute("UPDATE files SET last_indexed=? WHERE file_id=?", (now_utc(), fid))
-                continue
+                try:
+                    st = p.stat()
+                    size = st.st_size
+                    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+                    modified = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc).isoformat()
+                except Exception:
+                    size = None
+                    mtime_ns = None
+                    modified = None
+
+                fid = file_id_for_path(local_path)
+                new_sig = calc_content_sig(size, mtime_ns)
+                row_sig = cur.execute("SELECT content_sig FROM files WHERE file_id=?", (fid,)).fetchone()
+                old_sig = row_sig[0] if row_sig else None
+                row_exists = cur.execute("SELECT 1 FROM files WHERE file_id=?", (fid,)).fetchone()
+                if row_exists and old_sig and new_sig and old_sig == new_sig:
+                    if ext == ".pdf" and is_online_only(local_path):
+                        upsert_file(cur, fid, local_path, ext, size, modified, None, "online_only", content_sig=new_sig)
+                        meta_only += 1
+                        continue
+
+                    skipped_unchanged += 1
+                    cur.execute("UPDATE files SET last_indexed=? WHERE file_id=?", (now_utc(), fid))
+                    continue
             
 
             try:
